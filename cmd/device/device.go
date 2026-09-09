@@ -658,10 +658,18 @@ by design.`,
 				rows = append(rows, map[string]interface{}{
 					"prefix":  c.Prefix,
 					"state":   state,
+					"hint":    string(c.Hint),
 					"holders": strings.Join(holders, ", "),
 				})
 			}
-			return output.Print(format, rows, []string{"prefix", "state", "holders"})
+			if err := output.Print(format, rows, []string{"prefix", "state", "hint", "holders"}); err != nil {
+				return err
+			}
+			fmt.Fprintln(cmd.OutOrStdout(),
+				"\nhint is a guess from the devices' public IPs: same-egress suggests one site\n"+
+					"(deliberate redundancy), different-egress suggests two sites reusing an address\n"+
+					"plan. CGNAT and multi-VLAN sites can fool it — confirm before acting.")
+			return nil
 		},
 	}
 
