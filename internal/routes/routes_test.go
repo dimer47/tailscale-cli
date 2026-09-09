@@ -120,6 +120,99 @@ func TestFindConflictsSkipsMalformed(t *testing.T) {
 	}
 }
 
+func withEndpoints(d Device, endpoints ...string) Device {
+	d.ClientConnectivity = ClientConnectivity{Endpoints: endpoints}
+	return d
+}
+
+func TestEgressIPsFiltersNonPublic(t *testing.T) {
+	d := withEndpoints(Device{},
+		"88.186.186.131:41641",    // public, kept
+		"192.168.49.26:41641",     // private, skipped
+		"100.92.160.72:41641",     // tailnet CGNAT, skipped
+		"[2a01:e0a:ef4::1]:41641", // IPv6, skipped
+		"88.186.186.131:64640",    // duplicate of the first
+	)
+	got := d.EgressIPs()
+	if len(got) != 1 || got[0] != "88.186.186.131" {
+		t.Errorf("EgressIPs() = %v, want [88.186.186.131]", got)
+	}
+}
+
+func TestEgressIPsEmptyWhenNoEndpoints(t *testing.T) {
+	if got := (Device{}).EgressIPs(); len(got) != 0 {
+		t.Errorf("expected no egress IPs, got %v", got)
+	}
+}
+
+func TestConflictHintSameEgress(t *testing.T) {
+	// Two routers behind one connection: redundancy, not a mistake.
+	devices := []Device{
+		withEndpoints(dev("n1", "nas", []string{"192.168.0.0/24"}, []string{"192.168.0.0/24"}),
+			"109.190.141.7:41641"),
+		withEndpoints(dev("n2", "ha", []string{"192.168.0.0/24"}, []string{"192.168.0.0/24"}),
+			"109.190.141.7:12345"),
+	}
+	got := FindConflicts(devices)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 conflict, got %d", len(got))
+	}
+	if got[0].Hint != HintSameEgress {
+		t.Errorf("Hint = %q, want %q", got[0].Hint, HintSameEgress)
+	}
+}
+
+func TestConflictHintDifferentEgress(t *testing.T) {
+	// Two sites reusing the same address plan: a real conflict.
+	devices := []Device{
+		withEndpoints(dev("n1", "hangar", []string{"192.168.1.0/24"}, []string{"192.168.1.0/24"}),
+			"88.186.186.131:41641"),
+		withEndpoints(dev("n2", "nas", []string{"192.168.1.0/24"}, []string{"192.168.1.0/24"}),
+			"109.190.217.178:41641"),
+	}
+	got := FindConflicts(devices)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 conflict, got %d", len(got))
+	}
+	if got[0].Hint != HintDifferentEgress {
+		t.Errorf("Hint = %q, want %q", got[0].Hint, HintDifferentEgress)
+	}
+}
+
+func TestConflictHintUnknownWithoutEndpoints(t *testing.T) {
+	// An offline device reports no endpoints; guessing would be worse than
+	// admitting we cannot tell.
+	devices := []Device{
+		withEndpoints(dev("n1", "a", []string{"10.0.0.0/8"}, []string{"10.0.0.0/8"}),
+			"88.186.186.131:41641"),
+		dev("n2", "b", []string{"10.0.0.0/8"}, []string{"10.0.0.0/8"}),
+	}
+	got := FindConflicts(devices)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 conflict, got %d", len(got))
+	}
+	if got[0].Hint != HintUnknown {
+		t.Errorf("Hint = %q, want %q", got[0].Hint, HintUnknown)
+	}
+}
+
+func TestConflictHintPrivateOnlyEndpointsAreUnknown(t *testing.T) {
+	// Endpoints exist but none are public: still inconclusive.
+	devices := []Device{
+		withEndpoints(dev("n1", "a", []string{"10.0.0.0/8"}, []string{"10.0.0.0/8"}),
+			"192.168.1.5:41641"),
+		withEndpoints(dev("n2", "b", []string{"10.0.0.0/8"}, []string{"10.0.0.0/8"}),
+			"192.168.1.6:41641"),
+	}
+	got := FindConflicts(devices)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 conflict, got %d", len(got))
+	}
+	if got[0].Hint != HintUnknown {
+		t.Errorf("Hint = %q, want %q", got[0].Hint, HintUnknown)
+	}
+}
+
 func TestToggleEnable(t *testing.T) {
 	got, changed, err := Toggle([]string{"0.0.0.0/0"}, "192.168.1.0/24", true)
 	if err != nil {

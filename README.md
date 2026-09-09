@@ -375,7 +375,7 @@ Add to your Claude Code settings (or VS Code / JetBrains with the Claude extensi
 | `device-routes-set` | Set device routes (replaces the whole list) |
 | `device-routes-enable` | Enable one route, leaving the others untouched |
 | `device-routes-disable` | Disable one route, leaving the others untouched |
-| `device-routes-conflicts` | Find subnets advertised by more than one device |
+| `device-routes-conflicts` | Find subnets advertised by more than one device, with a same-site hint |
 | `acl-get` | Get the policy file (ACL) |
 | `acl-set` | Set the policy file |
 | `acl-validate` | Validate a policy file |

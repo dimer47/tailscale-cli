@@ -7,6 +7,7 @@ package routes
 
 import (
 	"fmt"
+	"net"
 	"net/netip"
 	"sort"
 	"strings"
@@ -18,14 +19,58 @@ var ExitNodeRoutes = []string{"0.0.0.0/0", "::/0"}
 
 // Device is the subset of the Tailscale device API used for route analysis.
 type Device struct {
-	NodeID           string   `json:"nodeId"`
-	Name             string   `json:"name"`
-	Hostname         string   `json:"hostname"`
-	Tags             []string `json:"tags"`
-	AdvertisedRoutes []string `json:"advertisedRoutes"`
-	EnabledRoutes    []string `json:"enabledRoutes"`
-	ConnectedToProxy bool     `json:"connectedToControl"`
+	NodeID             string             `json:"nodeId"`
+	Name               string             `json:"name"`
+	Hostname           string             `json:"hostname"`
+	Tags               []string           `json:"tags"`
+	AdvertisedRoutes   []string           `json:"advertisedRoutes"`
+	EnabledRoutes      []string           `json:"enabledRoutes"`
+	ConnectedToProxy   bool               `json:"connectedToControl"`
+	ClientConnectivity ClientConnectivity `json:"clientConnectivity"`
 }
+
+// ClientConnectivity carries the endpoints a device was last seen on. Only
+// populated with fields=all, and only for devices that recently communicated.
+type ClientConnectivity struct {
+	Endpoints []string `json:"endpoints"`
+}
+
+// EgressIPs returns the public IPv4 addresses the device is seen from.
+//
+// Two subnet routers sharing an egress IP are almost certainly on the same
+// physical site, which is the difference between a genuine conflict and
+// deliberate redundancy. Private and CGNAT ranges are excluded: they say nothing
+// about where the device sits. IPv6 endpoints are skipped — a device typically
+// has a globally routable v6 address per interface, so they do not identify a
+// site the way a shared NAT address does.
+func (d Device) EgressIPs() []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, e := range d.ClientConnectivity.Endpoints {
+		host, _, err := net.SplitHostPort(e)
+		if err != nil {
+			continue
+		}
+		addr, err := netip.ParseAddr(host)
+		if err != nil || !addr.Is4() {
+			continue
+		}
+		if addr.IsPrivate() || addr.IsLoopback() || addr.IsLinkLocalUnicast() || isCGNAT(addr) {
+			continue
+		}
+		if !seen[host] {
+			seen[host] = true
+			out = append(out, host)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// cgnatRange is 100.64.0.0/10, which Tailscale itself uses for tailnet addresses.
+var cgnatRange = netip.MustParsePrefix("100.64.0.0/10")
+
+func isCGNAT(a netip.Addr) bool { return cgnatRange.Contains(a) }
 
 // ShortName returns the device name without its tailnet suffix.
 func (d Device) ShortName() string {
@@ -50,12 +95,27 @@ func IsExitNodeRoute(cidr string) bool {
 
 // Holder is one device advertising or enabling a prefix.
 type Holder struct {
-	NodeID  string `json:"nodeId"`
-	Name    string `json:"name"`
-	Route   string `json:"route"`
-	Enabled bool   `json:"enabled"`
-	Online  bool   `json:"online"`
+	NodeID    string   `json:"nodeId"`
+	Name      string   `json:"name"`
+	Route     string   `json:"route"`
+	Enabled   bool     `json:"enabled"`
+	Online    bool     `json:"online"`
+	EgressIPs []string `json:"egressIPs,omitempty"`
 }
+
+// Hint classifies why several devices carry the same prefix.
+type Hint string
+
+const (
+	// HintSameEgress means the holders share a public IP, so they are very
+	// likely on one site — deliberate redundancy rather than a mistake.
+	HintSameEgress Hint = "same-egress"
+	// HintDifferentEgress means the holders reach the internet through different
+	// public IPs, so they are probably distinct sites reusing an address plan.
+	HintDifferentEgress Hint = "different-egress"
+	// HintUnknown means there was not enough endpoint data to tell.
+	HintUnknown Hint = "unknown"
+)
 
 // Conflict is a set of overlapping prefixes held by two or more devices.
 //
@@ -64,6 +124,58 @@ type Holder struct {
 type Conflict struct {
 	Prefix  string   `json:"prefix"`
 	Holders []Holder `json:"holders"`
+	// Hint is a heuristic, never a verdict: a shared egress IP suggests one
+	// site, but CGNAT can hide two, and one site can have two VLANs behind a
+	// single connection. Callers should surface it, not act on it silently.
+	Hint Hint `json:"hint"`
+}
+
+// classify derives the Hint from the holders' egress IPs.
+func classify(holders []Holder) Hint {
+	sets := make([][]string, 0, len(holders))
+	byNode := map[string][]string{}
+	for _, h := range holders {
+		if _, seen := byNode[h.NodeID]; seen {
+			continue
+		}
+		byNode[h.NodeID] = h.EgressIPs
+		sets = append(sets, h.EgressIPs)
+	}
+
+	// A device with no endpoints (offline, or fields=all not requested) leaves
+	// the comparison inconclusive rather than wrong.
+	for _, s := range sets {
+		if len(s) == 0 {
+			return HintUnknown
+		}
+	}
+	if len(sets) < 2 {
+		return HintUnknown
+	}
+
+	// Any shared address is enough: a device often reports several endpoints,
+	// and one address in common still places them behind the same egress.
+	for i := range sets {
+		for j := i + 1; j < len(sets); j++ {
+			if !overlapStrings(sets[i], sets[j]) {
+				return HintDifferentEgress
+			}
+		}
+	}
+	return HintSameEgress
+}
+
+func overlapStrings(a, b []string) bool {
+	set := make(map[string]bool, len(a))
+	for _, v := range a {
+		set[v] = true
+	}
+	for _, v := range b {
+		if set[v] {
+			return true
+		}
+	}
+	return false
 }
 
 // ActiveHolders returns the holders whose route is approved. More than one means
@@ -144,11 +256,12 @@ func FindConflicts(devices []Device) []Conflict {
 			}
 			for _, e := range []entry{a, b} {
 				groups[key][e.dev.NodeID+"|"+e.route] = Holder{
-					NodeID:  e.dev.NodeID,
-					Name:    e.dev.ShortName(),
-					Route:   e.route,
-					Enabled: contains(e.dev.EnabledRoutes, e.route),
-					Online:  e.dev.ConnectedToProxy,
+					NodeID:    e.dev.NodeID,
+					Name:      e.dev.ShortName(),
+					Route:     e.route,
+					Enabled:   contains(e.dev.EnabledRoutes, e.route),
+					Online:    e.dev.ConnectedToProxy,
+					EgressIPs: e.dev.EgressIPs(),
 				}
 			}
 		}
@@ -166,7 +279,7 @@ func FindConflicts(devices []Device) []Conflict {
 			}
 			return list[i].Route < list[j].Route
 		})
-		out = append(out, Conflict{Prefix: prefix, Holders: list})
+		out = append(out, Conflict{Prefix: prefix, Holders: list, Hint: classify(list)})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Prefix < out[j].Prefix })
 	return out

@@ -156,7 +156,7 @@ func runMcpServer() error {
 	), makeRoutesToggleHandler(false))
 
 	s.AddTool(mcp.NewTool("device-routes-conflicts",
-		mcp.WithDescription("Liste les sous-réseaux annoncés par plusieurs devices à la fois. Tailscale ne route un subnet que via un seul device : deux machines annonçant 192.168.1.0/24 signifie que le trafic part silencieusement vers l'une des deux. Les chevauchements comptent aussi (un /25 dans un /24). Les routes d'exit node (0.0.0.0/0, ::/0) sont exclues."),
+		mcp.WithDescription("Liste les sous-réseaux annoncés par plusieurs devices à la fois. Tailscale ne route un subnet que via un seul device : deux machines annonçant 192.168.1.0/24 signifie que le trafic part silencieusement vers l'une des deux. Les chevauchements comptent aussi (un /25 dans un /24). Les routes d'exit node (0.0.0.0/0, ::/0) sont exclues. Chaque conflit porte un champ hint déduit des IP publiques : same-egress suggère un même site (redondance voulue), different-egress deux sites réutilisant le même plan d'adressage, unknown si les données manquent. C'est une heuristique — le CGNAT et les sites multi-VLAN peuvent la tromper, donc la présenter comme un indice et non comme un verdict."),
 		mcp.WithBoolean("activeOnly", mcp.Description("Ne remonter que les conflits où plusieurs routes sont réellement approuvées")),
 	), handleRoutesConflicts)
 

@@ -372,7 +372,7 @@ Ajoutez dans vos settings Claude Code (ou VS Code / JetBrains avec l'extension C
 | `device-routes-set` | Définir les routes d'un device (remplace toute la liste) |
 | `device-routes-enable` | Activer une route sans toucher aux autres |
 | `device-routes-disable` | Désactiver une route sans toucher aux autres |
-| `device-routes-conflicts` | Détecter les sous-réseaux annoncés par plusieurs devices |
+| `device-routes-conflicts` | Détecter les sous-réseaux annoncés par plusieurs devices, avec un indice de même site |
 | `acl-get` | Récupérer le policy file (ACL) |
 | `acl-set` | Définir le policy file |
 | `acl-validate` | Valider un policy file |
