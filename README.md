@@ -209,6 +209,14 @@ tailscale-cli device delete <nodeId> --confirm         # Delete
 ```bash
 tailscale-cli device routes list <nodeId>
 tailscale-cli device routes set <nodeId> --routes 10.0.0.0/16,192.168.1.0/24
+
+# Toggle a single route, leaving the others (and the exit node) untouched
+tailscale-cli device routes enable <nodeId> 192.168.1.0/24
+tailscale-cli device routes disable <nodeId> 192.168.1.0/24
+
+# Find subnets advertised by more than one device
+tailscale-cli device routes conflicts
+tailscale-cli device routes conflicts --active
 ```
 
 ### ACL / Policy File
@@ -364,7 +372,10 @@ Add to your Claude Code settings (or VS Code / JetBrains with the Claude extensi
 | `device-expire` | Expire a device key |
 | `device-delete` | Delete a device |
 | `device-routes-list` | List device routes |
-| `device-routes-set` | Set device routes |
+| `device-routes-set` | Set device routes (replaces the whole list) |
+| `device-routes-enable` | Enable one route, leaving the others untouched |
+| `device-routes-disable` | Disable one route, leaving the others untouched |
+| `device-routes-conflicts` | Find subnets advertised by more than one device |
 | `acl-get` | Get the policy file (ACL) |
 | `acl-set` | Set the policy file |
 | `acl-validate` | Validate a policy file |

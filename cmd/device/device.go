@@ -10,6 +10,7 @@ import (
 
 	"github.com/dimer47/tailscale-cli/internal/api"
 	"github.com/dimer47/tailscale-cli/internal/output"
+	"github.com/dimer47/tailscale-cli/internal/routes"
 	"github.com/spf13/cobra"
 )
 
@@ -483,6 +484,188 @@ func newRoutesCmd(opts *DeviceOptions) *cobra.Command {
 
 	cmd.AddCommand(newRoutesListCmd(opts))
 	cmd.AddCommand(newRoutesSetCmd(opts))
+	cmd.AddCommand(newRoutesEnableCmd(opts))
+	cmd.AddCommand(newRoutesDisableCmd(opts))
+	cmd.AddCommand(newRoutesConflictsCmd(opts))
+
+	return cmd
+}
+
+// fetchEnabledRoutes returns the routes currently approved for a device.
+func fetchEnabledRoutes(client *api.Client, deviceID string) ([]string, error) {
+	body, err := client.Get(fmt.Sprintf("/device/%s/routes", deviceID))
+	if err != nil {
+		return nil, err
+	}
+	var resp struct {
+		EnabledRoutes []string `json:"enabledRoutes"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("parsing response: %w", err)
+	}
+	return resp.EnabledRoutes, nil
+}
+
+// putRoutes replaces the enabled route set for a device.
+func putRoutes(client *api.Client, deviceID string, list []string) ([]byte, error) {
+	if list == nil {
+		list = []string{}
+	}
+	data, err := json.Marshal(map[string][]string{"routes": list})
+	if err != nil {
+		return nil, fmt.Errorf("marshaling request body: %w", err)
+	}
+	return client.Post(fmt.Sprintf("/device/%s/routes", deviceID), bytes.NewReader(data))
+}
+
+// newRoutesToggleCmd builds the shared enable/disable command. The Tailscale API
+// replaces the whole route set on write, so both read the current state first and
+// send back the full list rather than a delta.
+func newRoutesToggleCmd(opts *DeviceOptions, enable bool) *cobra.Command {
+	verb, past := "enable", "enabled"
+	if !enable {
+		verb, past = "disable", "disabled"
+	}
+
+	return &cobra.Command{
+		Use:   verb + " <deviceId> <cidr>",
+		Short: strings.ToUpper(verb[:1]) + verb[1:] + " a single route without touching the others",
+		Long: fmt.Sprintf(`%s one route on a device, leaving every other approved route in place.
+
+The Tailscale API replaces the full route set on write, so this reads the current
+state first and sends the merged list back. Use it instead of "routes set" when you
+only mean to change one prefix — "set" silently drops anything you omit, exit node
+routes included.`, strings.ToUpper(verb[:1])+verb[1:]),
+		Args: cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			client, err := opts.GetClient()
+			if err != nil {
+				return err
+			}
+
+			deviceID, cidr := args[0], args[1]
+
+			current, err := fetchEnabledRoutes(client, deviceID)
+			if err != nil {
+				return err
+			}
+
+			next, changed, err := routes.Toggle(current, cidr, enable)
+			if err != nil {
+				return err
+			}
+			if !changed {
+				fmt.Fprintf(cmd.OutOrStdout(), "Route %s is already %s on %s, nothing to do.\n", cidr, past, deviceID)
+				return nil
+			}
+
+			respBody, err := putRoutes(client, deviceID, next)
+			if err != nil {
+				return err
+			}
+
+			var resp interface{}
+			if err := json.Unmarshal(respBody, &resp); err != nil {
+				return fmt.Errorf("parsing response: %w", err)
+			}
+			return output.Print(opts.GetOutputFormat(), resp, nil)
+		},
+	}
+}
+
+func newRoutesEnableCmd(opts *DeviceOptions) *cobra.Command {
+	return newRoutesToggleCmd(opts, true)
+}
+
+func newRoutesDisableCmd(opts *DeviceOptions) *cobra.Command {
+	return newRoutesToggleCmd(opts, false)
+}
+
+func newRoutesConflictsCmd(opts *DeviceOptions) *cobra.Command {
+	var activeOnly bool
+
+	cmd := &cobra.Command{
+		Use:   "conflicts",
+		Short: "Find subnet routes advertised by more than one device",
+		Long: `Report subnet prefixes carried by several devices at once.
+
+Tailscale routes a given subnet through exactly one device, so two machines
+advertising 192.168.1.0/24 means traffic silently goes to one of them. Overlaps
+count too: a /25 inside a /24 competes for the same addresses.
+
+Exit node routes (0.0.0.0/0, ::/0) are excluded — every exit node advertises them
+by design.`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			client, err := opts.GetClient()
+			if err != nil {
+				return err
+			}
+
+			tailnet := opts.GetTailnet()
+			body, err := client.Get(fmt.Sprintf("/tailnet/%s/devices?fields=all", tailnet))
+			if err != nil {
+				return err
+			}
+
+			var resp struct {
+				Devices []routes.Device `json:"devices"`
+			}
+			if err := json.Unmarshal(body, &resp); err != nil {
+				return fmt.Errorf("parsing response: %w", err)
+			}
+
+			conflicts := routes.FindConflicts(resp.Devices)
+
+			if activeOnly {
+				var live []routes.Conflict
+				for _, c := range conflicts {
+					if len(c.ActiveHolders()) > 1 {
+						live = append(live, c)
+					}
+				}
+				conflicts = live
+			}
+
+			format := opts.GetOutputFormat()
+			if format != "table" {
+				return output.Print(format, conflicts, nil)
+			}
+
+			if len(conflicts) == 0 {
+				fmt.Fprintln(cmd.OutOrStdout(), "No route conflicts found.")
+				return nil
+			}
+
+			rows := make([]map[string]interface{}, 0, len(conflicts))
+			for _, c := range conflicts {
+				var holders []string
+				for _, h := range c.Holders {
+					mark := " (approved)"
+					if !h.Enabled {
+						mark = " (advertised only)"
+					}
+					label := h.Name
+					if h.Route != c.Prefix {
+						label += " via " + h.Route
+					}
+					holders = append(holders, label+mark)
+				}
+				state := "latent"
+				if len(c.ActiveHolders()) > 1 {
+					state = "LIVE"
+				}
+				rows = append(rows, map[string]interface{}{
+					"prefix":  c.Prefix,
+					"state":   state,
+					"holders": strings.Join(holders, ", "),
+				})
+			}
+			return output.Print(format, rows, []string{"prefix", "state", "holders"})
+		},
+	}
+
+	cmd.Flags().BoolVar(&activeOnly, "active", false, "Only report conflicts where more than one route is approved")
 
 	return cmd
 }
