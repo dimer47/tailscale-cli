@@ -206,6 +206,14 @@ tailscale-cli device delete <nodeId> --confirm         # Supprimer
 ```bash
 tailscale-cli device routes list <nodeId>
 tailscale-cli device routes set <nodeId> --routes 10.0.0.0/16,192.168.1.0/24
+
+# Basculer une seule route, sans toucher aux autres (ni à l'exit node)
+tailscale-cli device routes enable <nodeId> 192.168.1.0/24
+tailscale-cli device routes disable <nodeId> 192.168.1.0/24
+
+# Détecter les sous-réseaux annoncés par plusieurs devices
+tailscale-cli device routes conflicts
+tailscale-cli device routes conflicts --active
 ```
 
 ### ACL / Policy File
@@ -361,7 +369,10 @@ Ajoutez dans vos settings Claude Code (ou VS Code / JetBrains avec l'extension C
 | `device-expire` | Expirer la clé d'un device |
 | `device-delete` | Supprimer un device |
 | `device-routes-list` | Lister les routes d'un device |
-| `device-routes-set` | Définir les routes d'un device |
+| `device-routes-set` | Définir les routes d'un device (remplace toute la liste) |
+| `device-routes-enable` | Activer une route sans toucher aux autres |
+| `device-routes-disable` | Désactiver une route sans toucher aux autres |
+| `device-routes-conflicts` | Détecter les sous-réseaux annoncés par plusieurs devices |
 | `acl-get` | Récupérer le policy file (ACL) |
 | `acl-set` | Définir le policy file |
 | `acl-validate` | Valider un policy file |

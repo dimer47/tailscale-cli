@@ -9,6 +9,7 @@ import (
 	"github.com/dimer47/tailscale-cli/internal/api"
 	"github.com/dimer47/tailscale-cli/internal/config"
 	"github.com/dimer47/tailscale-cli/internal/keychain"
+	"github.com/dimer47/tailscale-cli/internal/routes"
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 	"github.com/spf13/cobra"
@@ -141,6 +142,23 @@ func runMcpServer() error {
 		return fmt.Sprintf("/device/%s/routes", r.GetString("deviceId", "")),
 			map[string]interface{}{"routes": routes}
 	}))
+
+	s.AddTool(mcp.NewTool("device-routes-enable",
+		mcp.WithDescription("Active UNE route sur un device sans toucher aux autres. Préférer cet outil à device-routes-set, qui remplace toute la liste et fait perdre les routes non répétées (exit node compris)."),
+		mcp.WithString("deviceId", mcp.Required(), mcp.Description("ID du device")),
+		mcp.WithString("route", mcp.Required(), mcp.Description("Route à activer (ex: 192.168.1.0/24)")),
+	), makeRoutesToggleHandler(true))
+
+	s.AddTool(mcp.NewTool("device-routes-disable",
+		mcp.WithDescription("Désactive UNE route sur un device sans toucher aux autres. Préférer cet outil à device-routes-set, qui remplace toute la liste et fait perdre les routes non répétées (exit node compris)."),
+		mcp.WithString("deviceId", mcp.Required(), mcp.Description("ID du device")),
+		mcp.WithString("route", mcp.Required(), mcp.Description("Route à désactiver (ex: 192.168.1.0/24)")),
+	), makeRoutesToggleHandler(false))
+
+	s.AddTool(mcp.NewTool("device-routes-conflicts",
+		mcp.WithDescription("Liste les sous-réseaux annoncés par plusieurs devices à la fois. Tailscale ne route un subnet que via un seul device : deux machines annonçant 192.168.1.0/24 signifie que le trafic part silencieusement vers l'une des deux. Les chevauchements comptent aussi (un /25 dans un /24). Les routes d'exit node (0.0.0.0/0, ::/0) sont exclues."),
+		mcp.WithBoolean("activeOnly", mcp.Description("Ne remonter que les conflits où plusieurs routes sont réellement approuvées")),
+	), handleRoutesConflicts)
 
 	// --- ACL / Policy File ---
 	s.AddTool(mcp.NewTool("acl-get",
@@ -486,6 +504,104 @@ func runMcpServer() error {
 }
 
 // makeHandler creates a tool handler for JSON-body requests.
+// makeRoutesToggleHandler flips a single route without disturbing the others.
+//
+// The Tailscale API replaces the whole enabled set on write, so this reads the
+// current state first and sends the merged list back — unlike device-routes-set,
+// which silently drops anything the caller forgot to repeat.
+func makeRoutesToggleHandler(enable bool) server.ToolHandlerFunc {
+	return func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		client, err := resolveClient()
+		if err != nil {
+			return errorResult(err), nil
+		}
+
+		deviceID := request.GetString("deviceId", "")
+		route := request.GetString("route", "")
+		if deviceID == "" || route == "" {
+			return errorResult(fmt.Errorf("deviceId et route sont requis")), nil
+		}
+
+		body, err := client.Get(fmt.Sprintf("/device/%s/routes", deviceID))
+		if err != nil {
+			return errorResult(err), nil
+		}
+		var current struct {
+			EnabledRoutes []string `json:"enabledRoutes"`
+		}
+		if err := json.Unmarshal(body, &current); err != nil {
+			return errorResult(fmt.Errorf("parsing response: %w", err)), nil
+		}
+
+		next, changed, err := routes.Toggle(current.EnabledRoutes, route, enable)
+		if err != nil {
+			return errorResult(err), nil
+		}
+		if !changed {
+			state := "désactivée"
+			if enable {
+				state = "activée"
+			}
+			return textResult(fmt.Sprintf("Route %s déjà %s sur %s, aucun changement.", route, state, deviceID)), nil
+		}
+
+		data, err := client.DoJSON("POST", fmt.Sprintf("/device/%s/routes", deviceID),
+			map[string]interface{}{"routes": next})
+		if err != nil {
+			return errorResult(err), nil
+		}
+
+		var pretty interface{}
+		if json.Unmarshal(data, &pretty) == nil {
+			formatted, _ := json.MarshalIndent(pretty, "", "  ")
+			return textResult(string(formatted)), nil
+		}
+		return textResult(string(data)), nil
+	}
+}
+
+// handleRoutesConflicts reports subnet prefixes carried by more than one device.
+func handleRoutesConflicts(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	client, err := resolveClient()
+	if err != nil {
+		return errorResult(err), nil
+	}
+
+	data, err := client.Get(fmt.Sprintf("/tailnet/%s/devices?fields=all", resolveTailnet()))
+	if err != nil {
+		return errorResult(err), nil
+	}
+
+	var resp struct {
+		Devices []routes.Device `json:"devices"`
+	}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return errorResult(fmt.Errorf("parsing response: %w", err)), nil
+	}
+
+	found := routes.FindConflicts(resp.Devices)
+
+	if request.GetBool("activeOnly", false) {
+		var live []routes.Conflict
+		for _, c := range found {
+			if len(c.ActiveHolders()) > 1 {
+				live = append(live, c)
+			}
+		}
+		found = live
+	}
+
+	if len(found) == 0 {
+		return textResult("Aucun conflit de route détecté."), nil
+	}
+
+	formatted, err := json.MarshalIndent(found, "", "  ")
+	if err != nil {
+		return errorResult(err), nil
+	}
+	return textResult(string(formatted)), nil
+}
+
 func makeHandler(method string, pathFn func(mcp.CallToolRequest) (string, interface{})) server.ToolHandlerFunc {
 	return func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		client, err := resolveClient()
